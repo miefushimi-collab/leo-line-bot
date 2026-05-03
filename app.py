@@ -45,8 +45,8 @@ FREEE_REFRESH_TOKEN_INITIAL = os.environ.get("FREEE_REFRESH_TOKEN", "")
 FREEE_TOKEN_URL = "https://accounts.secure.freee.co.jp/public_api/token"
 FREEE_API_BASE = "https://api.freee.co.jp/api/1"
 
-# Railway Volume のトークン保存先
-TOKEN_FILE = Path("/data/freee_tokens.json")
+# トークン保存先（Railway Volume があれば /data、なければ /tmp にフォールバック）
+TOKEN_FILE = Path("/data/freee_tokens.json") if Path("/data").exists() else Path("/tmp/freee_tokens.json")
 
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 line_configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
