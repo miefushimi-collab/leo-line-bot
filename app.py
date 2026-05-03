@@ -45,15 +45,25 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 line_configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# freee アクセストークンのメモリキャッシュ
 _token_cache: dict = {"access_token": None, "expires_at": 0}
 _token_lock = threading.Lock()
 
-SYSTEM_PROMPT = """あなたはLeo経理アシスタントです。freeeの会計データの照会をサポートします。
-ユーザーから取引・売上・支出・経費などについて聞かれたら、get_deals ツールを使ってfreeeからデータを取得してください。
-回答はLINEのチャット形式で読みやすく、簡潔にまとめてください。
-金額は「円」単位でカンマ区切りで表示し、日付はわかりやすく表示してください。
-今日の日付は {today} です。"""
+SYSTEM_PROMPT = """あなたはLeo経理アシスタントです。freeeの会計データの照会・取引登録をサポートします。
+今日の日付は {today} です。
+
+【照会】
+取引・売上・支出・経費について聞かれたら get_deals を使ってfreeeからデータを取得してください。
+
+【取引登録】
+売上や支出の登録を依頼されたら、以下の手順で進めてください。
+1. 不足情報があれば確認する（取引先名、金額、日付、種別）
+2. get_account_items で勘定科目一覧を取得して適切な科目を選ぶ
+3. create_deal で登録する
+4. 登録完了を報告する
+
+日付が「今日」「昨日」などの場合は今日の日付から計算してください。
+金額は数字のみで扱い（カンマ・円マーク不要）、勘定科目はユーザーの言葉から最適なものを選んでください。
+回答はLINEのチャット形式で読みやすく、簡潔にまとめてください。"""
 
 TOOLS = [
     {
@@ -64,19 +74,72 @@ TOOLS = [
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "取得開始日（YYYY-MM-DD形式）。省略時は今月1日。",
+                    "description": "取得開始日（YYYY-MM-DD）。省略時は今月1日。",
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "取得終了日（YYYY-MM-DD形式）。省略時は今日。",
+                    "description": "取得終了日（YYYY-MM-DD）。省略時は今日。",
                 },
                 "deal_type": {
                     "type": "string",
                     "enum": ["income", "expense"],
-                    "description": "取引種別。income=収入、expense=支出。省略時は両方。",
+                    "description": "income=収入のみ、expense=支出のみ。省略時は両方。",
                 },
             },
             "required": [],
+        },
+    },
+    {
+        "name": "get_account_items",
+        "description": "freeeの勘定科目一覧を取得します。取引登録前に適切な勘定科目IDを調べるために使います。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "絞り込みキーワード（例：売上、仕入、交通）。省略時は全件。",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "create_deal",
+        "description": "freeeに取引（売上・支出）を登録します。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "issue_date": {
+                    "type": "string",
+                    "description": "取引日（YYYY-MM-DD）。",
+                },
+                "deal_type": {
+                    "type": "string",
+                    "enum": ["income", "expense"],
+                    "description": "income=収入・売上、expense=支出・経費。",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "金額（税込、円単位の整数）。",
+                },
+                "account_item_id": {
+                    "type": "integer",
+                    "description": "勘定科目ID（get_account_itemsで取得）。",
+                },
+                "partner_name": {
+                    "type": "string",
+                    "description": "取引先名。",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "摘要・メモ。",
+                },
+                "tax_code": {
+                    "type": "integer",
+                    "description": "税区分コード。省略時は課税10%（収入=1、支出=2）を自動設定。",
+                },
+            },
+            "required": ["issue_date", "deal_type", "amount", "account_item_id"],
         },
     },
 ]
@@ -89,7 +152,7 @@ def get_freee_token() -> str:
         if time.time() < _token_cache["expires_at"] - 60:
             return _token_cache["access_token"]
 
-        logger.info("freee access token を更新中...")
+        logger.info("freee アクセストークン更新中...")
         resp = requests.post(
             FREEE_TOKEN_URL,
             data={
@@ -104,7 +167,7 @@ def get_freee_token() -> str:
         data = resp.json()
         _token_cache["access_token"] = data["access_token"]
         _token_cache["expires_at"] = time.time() + data.get("expires_in", 21600)
-        logger.info("freee access token 更新完了")
+        logger.info("freee アクセストークン更新完了")
         return _token_cache["access_token"]
 
 
@@ -114,6 +177,21 @@ def freee_get(path: str, params: dict) -> dict:
         f"{FREEE_API_BASE}{path}",
         headers={"Authorization": f"Bearer {token}"},
         params=params,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def freee_post(path: str, payload: dict) -> dict:
+    token = get_freee_token()
+    resp = requests.post(
+        f"{FREEE_API_BASE}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
         timeout=30,
     )
     resp.raise_for_status()
@@ -161,15 +239,79 @@ def get_deals(
     }
 
 
+def get_account_items(keyword: str = None) -> dict:
+    data = freee_get("/account_items", {"company_id": FREEE_COMPANY_ID})
+    items = data.get("account_items", [])
+
+    if keyword:
+        items = [i for i in items if keyword in i.get("name", "")]
+
+    return {
+        "account_items": [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "category": item.get("account_category", ""),
+            }
+            for item in items
+        ]
+    }
+
+
+def create_deal(
+    issue_date: str,
+    deal_type: str,
+    amount: int,
+    account_item_id: int,
+    partner_name: str = None,
+    description: str = None,
+    tax_code: int = None,
+) -> dict:
+    if tax_code is None:
+        tax_code = 1 if deal_type == "income" else 2  # 課税10%デフォルト
+
+    deal_payload = {
+        "company_id": FREEE_COMPANY_ID,
+        "issue_date": issue_date,
+        "type": deal_type,
+        "details": [
+            {
+                "tax_code": tax_code,
+                "account_item_id": account_item_id,
+                "amount": amount,
+                "description": description or "",
+            }
+        ],
+    }
+    if partner_name:
+        deal_payload["partner_name"] = partner_name
+
+    data = freee_post("/deals", {"deal": deal_payload})
+    deal = data.get("deal", {})
+
+    return {
+        "success": True,
+        "id": deal.get("id"),
+        "issue_date": deal.get("issue_date"),
+        "type": "収入" if deal.get("type") == "income" else "支出",
+        "amount": amount,
+        "partner_name": partner_name or "-",
+        "description": description or "",
+    }
+
+
 def execute_tool(name: str, tool_input: dict) -> str:
     try:
         if name == "get_deals":
-            result = get_deals(**tool_input)
-            return json.dumps(result, ensure_ascii=False)
+            return json.dumps(get_deals(**tool_input), ensure_ascii=False)
+        if name == "get_account_items":
+            return json.dumps(get_account_items(**tool_input), ensure_ascii=False)
+        if name == "create_deal":
+            return json.dumps(create_deal(**tool_input), ensure_ascii=False)
         return json.dumps({"error": f"Unknown tool: {name}"})
     except requests.HTTPError as e:
-        logger.error("freee API error: %s", e)
-        return json.dumps({"error": f"freee APIエラー: {e.response.status_code}"})
+        logger.error("freee API error: %s %s", e.response.status_code, e.response.text)
+        return json.dumps({"error": f"freee APIエラー: {e.response.status_code}", "detail": e.response.text})
     except Exception as e:
         logger.error("Tool error: %s", e)
         return json.dumps({"error": str(e)})
@@ -183,7 +325,7 @@ def ask_claude(user_message: str) -> str:
 
     messages = [{"role": "user", "content": user_message}]
 
-    for _ in range(5):  # ツール呼び出しは最大5回まで
+    for _ in range(8):  # ツール呼び出しは最大8回まで
         response = claude.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
